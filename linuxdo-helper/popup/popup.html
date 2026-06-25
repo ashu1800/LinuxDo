@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <header>
+      <h1>LinuxDoHelper</h1>
+      <span id="statusDot" class="dot gray"></span>
+      <span id="statusText">加载中...</span>
+    </header>
+
+    <!-- Tab Navigation -->
+    <nav>
+      <button id="tabDashboard" class="tab active">仪表盘</button>
+      <button id="tabSettings" class="tab">设置</button>
+    </nav>
+
+    <!-- Dashboard Tab -->
+    <section id="dashboard">
+      <!-- Current Operation -->
+      <div id="currentOperation" class="operation-card hidden">
+        <div class="op-header">
+          <span id="opIcon" class="op-icon">&#9654;</span>
+          <span id="opTitle" class="op-type">操作中</span>
+        </div>
+        <div id="opDesc" class="op-desc"></div>
+        <div id="opTopicTitle" class="op-topic"></div>
+        <div id="opProgress" class="op-progress-bar">
+          <div id="opProgressFill" class="op-progress-fill"></div>
+        </div>
+      </div>
+
+      <!-- Operation Queue -->
+      <div id="operationQueue" class="queue-section hidden">
+        <h3>待操作队列</h3>
+        <div id="queueList"></div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat"><span id="statReplied">0</span><label>已回复</label></div>
+        <div class="stat"><span id="statSkipped">0</span><label>已跳过</label></div>
+        <div class="stat"><span id="statDiscarded">0</span><label>未通过</label></div>
+        <div class="stat"><span id="statCommentReplies">0</span><label>评论回复</label></div>
+      </div>
+
+      <div class="controls">
+        <button id="btnPause" class="btn">暂停</button>
+        <button id="btnRunNow" class="btn btn-primary">手动运行</button>
+      </div>
+
+      <h3>最近活动</h3>
+      <ul id="activityList">
+        <li style="color: var(--text-muted); padding: 8px 0; font-size: 12px;">加载中...</li>
+      </ul>
+    </section>
+
+    <!-- Settings Tab -->
+    <section id="settings" class="hidden">
+      <div class="form-group">
+        <label>DeepSeek API Key</label>
+        <input type="password" id="inputApiKey" placeholder="sk-..." autocomplete="off">
+      </div>
+
+      <h3>工作时段</h3>
+      <div id="scheduleContainer"></div>
+
+      <h3>监测版块</h3>
+      <div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
+        <button id="btnRefreshCategories" class="btn-small">刷新版块列表</button>
+        <span id="categoryStatus" style="font-size:11px;color:var(--text-muted);"></span>
+      </div>
+      <div id="categoriesContainer">
+        <p style="color:var(--text-muted);font-size:12px;">点击刷新按钮获取版块列表</p>
+      </div>
+
+      <h3>回复设置</h3>
+      <div class="form-group">
+        <label>回复频率</label>
+        <select id="selectFrequency">
+          <option value="conservative">保守（~3条/小时）</option>
+          <option value="moderate" selected>适中（~8条/小时）</option>
+          <option value="aggressive">激进（~15条/小时）</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>
+          <input type="checkbox" id="chkAutoComment" checked>
+          自动回复评论（有人回复你时自动回覆）
+        </label>
+      </div>
+
+      <button id="btnSaveSettings" class="btn btn-primary" style="width:100%;">保存设置</button>
+      <div id="saveFeedback" style="margin-top:6px;font-size:12px;color:var(--success);display:none;"></div>
+    </section>
+
+    <footer class="version">v1.0.0</footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

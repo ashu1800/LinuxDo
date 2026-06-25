@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "LinuxDoHelper",
+  "version": "1.0.0",
+  "description": "智能辅助 linux.do 论坛互动",
+  "permissions": [
+    "storage",
+    "alarms",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://linux.do/*",
+    "https://api.deepseek.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "LinuxDoHelper"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://linux.do/*"],
+      "js": ["content/content.js"]
+    }
+  ],
+  "icons": {
+    "128": "icons/icon128.png"
+  }
+}
