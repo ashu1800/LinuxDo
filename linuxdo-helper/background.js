@@ -26,12 +26,20 @@ let currentOperation = {
 
 let operationQueue = []; // [{ topicId, title, action, status }]
 
+async function persistOperation(op) {
+  try {
+    await chrome.storage.local.set({ persistedOp: { ...op, persistedAt: Date.now() } });
+  } catch (_) {}
+}
+
 function setOperation(type, description, topicTitle, progress) {
   currentOperation = { type, description, topicTitle, progress, startTime: Date.now() };
+  persistOperation(currentOperation);
 }
 
 function clearOperation() {
   currentOperation = { type: 'idle', description: '', topicTitle: '', progress: 0, startTime: 0 };
+  persistOperation(currentOperation);
 }
 
 function clearAll() {
@@ -209,78 +217,93 @@ async function handleNewTopicsCheck() {
 
       const rateCheck = canReplyNow(state, settings);
       if (!rateCheck.allowed) {
+        operationQueue[qi].status = 'pending';
         setOperation('waiting', rateCheck.reason, '', 0);
+        state.lastQueue = operationQueue.slice();
+        await setState(state);
         console.log(`[LinuxDoHelper] Rate limited: ${rateCheck.reason}`);
         break;
       }
 
-      tracked[topic.id] = { processed: true, time: Date.now(), replied: false };
+      let replyPosted = false;
+      tracked[topic.id] = { visited: true, time: Date.now(), replied: false };
 
-      // Read topic detail via DOM navigation
+      // Read topic detail + check commentability in one navigation
       setOperation('reading', '正在读取帖子详情...', topic.title, 20);
       const detail = await navigateAndAct(tab.id, `https://linux.do/t/${topic.id}`, 'getTopicDetail');
 
-      const firstPost = detail.post_stream?.posts?.[0];
-      const topicData = {
-        id: topic.id,
-        title: detail.title || topic.title,
-        excerpt: firstPost?.plain || firstPost?.cooked || '',
-        replyCount: topic.posts_count || 0
-      };
+      // `detail.commentable` is returned from extractTopicDetail()
+      if (detail && detail.commentable) {
+        // Generate reply with safety check (skip worth-replying gate)
+        setOperation('evaluating', '正在 AI 生成回复...', topic.title, 55);
+        const firstPost = detail.post_stream?.posts?.[0];
+        const topicData = {
+          id: topic.id,
+          title: detail.title || topic.title,
+          excerpt: firstPost?.plain || firstPost?.cooked || '',
+          replyCount: topic.posts_count || 0
+        };
+        const replyResult = await generateReplyWithSafetyCheck(topicData, settings.apiKey, chat);
 
-      // Evaluate with DeepSeek and generate reply
-      setOperation('evaluating', '正在 AI 分析帖子...', topic.title, 40);
-      const evalResult = await evaluateAndReply(topicData, settings.apiKey, chat);
-
-      if (evalResult.action === 'reply') {
-        setOperation('posting', '正在提交回复...', topic.title, 80);
-        // Post reply via DOM navigation (includes navigation + fill + submit)
-        const postResult = await navigateAndAct(tab.id, `https://linux.do/t/${topic.id}`, 'postReply', {
-          content: evalResult.content
-        });
-
-        if (postResult.success) {
-          tracked[topic.id].replied = true;
-          tracked[topic.id].replyTime = Date.now();
-          state.lastReplyTime = Date.now();
-          state.replyCountThisHour++;
-          state.replyHistory.push({
-            topicId: topic.id, title: topic.title,
-            content: evalResult.content, time: Date.now(), type: 'topic'
+        if (replyResult.action === 'reply') {
+          setOperation('posting', '正在提交回复...', topic.title, 80);
+          const postResult = await navigateAndAct(tab.id, `https://linux.do/t/${topic.id}`, 'postReply', {
+            content: replyResult.content
           });
 
+          if (postResult.success) {
+            tracked[topic.id].replied = true;
+            tracked[topic.id].replyTime = Date.now();
+            state.lastReplyTime = Date.now();
+            state.replyCountThisHour++;
+            state.replyHistory.push({
+              topicId: topic.id, title: topic.title,
+              content: replyResult.content, time: Date.now(), type: 'topic'
+            });
+
+            await addActivity({
+              type: 'reply', topicId: topic.id, title: topic.title,
+              status: 'success', message: '回复成功'
+            });
+            operationQueue[qi].status = 'completed';
+            replyPosted = true;
+            console.log(`[LinuxDoHelper] Replied to topic #${topic.id}: ${topic.title}`);
+          } else {
+            operationQueue[qi].status = 'discarded';
+            await addActivity({
+              type: 'discard', topicId: topic.id, title: topic.title,
+              status: 'warning', message: '回复提交失败'
+            });
+          }
+        } else {
+          operationQueue[qi].status = 'discarded';
           await addActivity({
-            type: 'reply', topicId: topic.id, title: topic.title,
-            status: 'success', message: '回复成功'
+            type: 'discard', topicId: topic.id, title: topic.title,
+            status: 'warning', message: replyResult.reason || '回复生成失败'
           });
-          operationQueue[qi].status = 'completed';
-          console.log(`[LinuxDoHelper] Replied to topic #${topic.id}: ${topic.title}`);
         }
-      } else if (evalResult.action === 'skip') {
+
+        // Wait reply interval after successful reply
+        if (replyPosted) {
+          setOperation('waiting', `等待回复间隔 ${settings.minReplyInterval} 分钟...`, '', 95);
+          await sleep(settings.minReplyInterval * 60000);
+        }
+      } else {
+        // Topic not commentable — just mark as browsed
         operationQueue[qi].status = 'skipped';
         await addActivity({
           type: 'skip', topicId: topic.id, title: topic.title,
-          status: 'info', message: evalResult.reason || ''
-        });
-      } else {
-        operationQueue[qi].status = 'discarded';
-        await addActivity({
-          type: 'discard', topicId: topic.id, title: topic.title,
-          status: 'warning', message: evalResult.reason || ''
+          status: 'info', message: detail?.commentableReason || '话题不可评论，已标记已浏览'
         });
       }
 
       state.trackedTopics = tracked;
       await setState(state);
-
-      if (evalResult.action === 'reply') {
-        setOperation('waiting', `等待回复间隔 ${settings.minReplyInterval} 分钟...`, '', 95);
-        await sleep(settings.minReplyInterval * 60000);
-      }
     }
 
     clearOperation();
 
+    state.lastQueue = operationQueue.slice();
     state.trackedTopics = tracked;
     state.errorCount = 0;
     state.lastErrorTime = 0;
@@ -291,7 +314,11 @@ async function handleNewTopicsCheck() {
     console.error('[LinuxDoHelper] Topic check error:', err);
     await addActivity({ type: 'error', status: 'error', message: `帖子检查异常: ${err.message}` });
     const s = await getState();
-    await setState({ errorCount: (s.errorCount || 0) + 1, lastErrorTime: Date.now() });
+    await setState({
+      errorCount: (s.errorCount || 0) + 1,
+      lastErrorTime: Date.now(),
+      lastQueue: [{ title: `检查异常: ${err.message}`, status: 'error', action: '', topicId: 0 }]
+    });
   }
 }
 
@@ -399,7 +426,11 @@ async function handleNotificationCheck() {
   } catch (err) {
     clearAll();
     console.error('[LinuxDoHelper] Notification check error:', err);
-    await setState({ errorCount: (state.errorCount || 0) + 1, lastErrorTime: Date.now() });
+    await setState({
+      errorCount: (state.errorCount || 0) + 1,
+      lastErrorTime: Date.now(),
+      lastQueue: [{ title: `检查异常: ${err.message}`, status: 'error', action: '', topicId: 0 }]
+    });
   }
 }
 
@@ -474,7 +505,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     switch (request.action) {
       case 'getStatus': {
         const { settings, state, activityLog } = await getStorage();
+        const opResult = await chrome.storage.local.get(['persistedOp']);
+        const persistedOp = opResult.persistedOp;
         const scheduleStatus = getScheduleStatus(settings.schedule);
+
+        // Use in-memory operation if active, otherwise show last known state
+        const opToShow = currentOperation.type !== 'idle'
+          ? currentOperation
+          : (persistedOp && (Date.now() - persistedOp.persistedAt < 60000)
+            ? persistedOp
+            : currentOperation);
+
         return {
           isPaused: state.isPaused,
           isWorking: scheduleStatus.working,
@@ -483,8 +524,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           tabOpen: !!(await findLinuxDoTab()),
           stats: computeStats(state, activityLog),
           scheduleStatus,
-          currentOp: currentOperation,
-          queue: operationQueue
+          currentOp: opToShow,
+          queue: operationQueue,
+          lastQueue: state.lastQueue || []
         };
       }
 

@@ -33,7 +33,8 @@ const DEFAULT_STATE = {
   replyHistory: [],
   lastReplyTime: 0,
   replyCountThisHour: 0,
-  replyHourStart: 0
+  replyHourStart: 0,
+  lastQueue: []
 };
 
 async function getStorage() {

@@ -38,17 +38,22 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 function switchTab(tab) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => {
+    t.classList.remove('active');
+    t.setAttribute('aria-selected', 'false');
+  });
   document.getElementById('dashboard').classList.add('hidden');
   document.getElementById('settings').classList.add('hidden');
 
   if (tab === 'dashboard') {
     document.getElementById('tabDashboard').classList.add('active');
+    document.getElementById('tabDashboard').setAttribute('aria-selected', 'true');
     document.getElementById('dashboard').classList.remove('hidden');
     refreshStatus();
     refreshActivityLog();
   } else {
     document.getElementById('tabSettings').classList.add('active');
+    document.getElementById('tabSettings').setAttribute('aria-selected', 'true');
     document.getElementById('settings').classList.remove('hidden');
     loadSettings();
   }
@@ -111,7 +116,7 @@ async function refreshOperation() {
     const status = await chrome.runtime.sendMessage({ action: 'getStatus' });
     if (!status) return;
     renderCurrentOp(status.currentOp);
-    renderQueue(status.queue);
+    renderQueue(status.queue, status.lastQueue);
   } catch (err) {
     // Silently fail - operation display is not critical
   }
@@ -121,12 +126,18 @@ function renderCurrentOp(op) {
   const card = document.getElementById('currentOperation');
   if (!card) return;
 
+  // Always show the card — never hide it
+  card.classList.remove('hidden');
+
   if (!op || op.type === 'idle') {
-    card.classList.add('hidden');
+    document.getElementById('opIcon').textContent = '⏸';
+    document.getElementById('opIcon').className = 'op-icon idle';
+    document.getElementById('opTitle').textContent = '空闲中';
+    document.getElementById('opDesc').textContent = '等待定时检查或手动触发';
+    document.getElementById('opTopicTitle').textContent = '';
+    document.getElementById('opProgressFill').style.width = '0%';
     return;
   }
-
-  card.classList.remove('hidden');
 
   const iconMap = {
     navigating: '\u25B6',
@@ -159,27 +170,41 @@ function getOpTitle(type) {
   return titles[type] || '操作中';
 }
 
-function renderQueue(queue) {
+function renderQueue(queue, lastQueue) {
   const section = document.getElementById('operationQueue');
   const list = document.getElementById('queueList');
   if (!section || !list) return;
 
-  if (!queue || queue.length === 0) {
-    section.classList.add('hidden');
-    return;
+  // Always show the section \u2014 never hide it
+  section.classList.remove('hidden');
+
+  const items = (queue && queue.length > 0) ? queue : (lastQueue || []);
+  const isHistory = !queue || queue.length === 0;
+
+  const heading = section.querySelector('h3');
+  if (heading) {
+    if (items.length === 0) {
+      heading.textContent = '\u64CD\u4F5C\u8BB0\u5F55';
+    } else {
+      heading.textContent = isHistory ? '\u4E0A\u6B21\u68C0\u67E5\u7ED3\u679C' : '\u5F85\u64CD\u4F5C\u961F\u5217';
+    }
   }
 
-  section.classList.remove('hidden');
+  if (items.length === 0) {
+    list.innerHTML = '<div class="queue-empty">\u6682\u65E0\u8BB0\u5F55\uFF0C\u70B9\u51FB\u300C\u624B\u52A8\u8FD0\u884C\u300D\u5F00\u59CB\u68C0\u67E5</div>';
+    return;
+  }
 
   const iconMap = {
     completed: '\u2705',
     processing: '\u25B6',
     pending: '\u23F3',
     skipped: '\u23ED',
-    discarded: '\u26A0'
+    discarded: '\u26A0',
+    error: '\u274C'
   };
 
-  list.innerHTML = queue.map(item => `
+  list.innerHTML = items.map(item => `
     <div class="queue-item">
       <span class="status-icon ${item.status}">${iconMap[item.status] || '\u2022'}</span>
       <span class="queue-title">${escapeHtml(item.title)}</span>
@@ -248,19 +273,30 @@ function escapeHtml(text) {
 // ========== Controls ==========
 
 async function togglePause() {
-  const btn = document.getElementById('btnPause');
-  const isPaused = btn.textContent === '暂停';
-  await chrome.runtime.sendMessage({ action: isPaused ? 'pause' : 'resume' });
+  const status = await chrome.runtime.sendMessage({ action: 'getStatus' });
+  const action = status?.isPaused ? 'resume' : 'pause';
+  await chrome.runtime.sendMessage({ action });
   await refreshStatus();
 }
 
 async function runNow() {
   const btn = document.getElementById('btnRunNow');
-  btn.textContent = '正在运行（可能需要30秒）...';
+  btn.textContent = '运行中...';
   btn.disabled = true;
   await chrome.runtime.sendMessage({ action: 'runNow' });
-  // Give enough time for the background to complete
-  await sleep(5000);
+
+  // Poll until operation completes or timeout
+  const startTime = Date.now();
+  const timeout = 120000; // 2 min max
+  while (Date.now() - startTime < timeout) {
+    await sleep(2000);
+    const status = await chrome.runtime.sendMessage({ action: 'getStatus' });
+    const activeTypes = ['navigating', 'reading', 'evaluating', 'posting', 'waiting'];
+    if (!activeTypes.includes(status?.currentOp?.type)) {
+      break;
+    }
+  }
+
   btn.textContent = '手动运行';
   btn.disabled = false;
   refreshStatus();
@@ -291,22 +327,69 @@ async function loadSettings() {
 
 function renderSchedule(schedule) {
   const container = document.getElementById('scheduleContainer');
-  container.innerHTML = DAY_NAMES.map(day => {
+  container.innerHTML = '';
+
+  for (const day of DAY_NAMES) {
     const d = schedule?.[day] || { enabled: false, start: '09:00', end: '12:00', breakStart: '14:00', breakEnd: '18:00' };
-    return `
-      <div class="schedule-row">
-        <label>${DAY_LABELS[day]}</label>
-        <input type="checkbox" data-day="${day}" class="day-enable" ${d.enabled ? 'checked' : ''}>
-        <input type="time" data-day="${day}" class="day-start" value="${d.start || '09:00'}">
-        <span style="color:var(--text-muted)">-</span>
-        <input type="time" data-day="${day}" class="day-end" value="${d.end || '12:00'}">
-        <span style="color:var(--text-muted)">&#8203;</span>
-        <input type="time" data-day="${day}" class="day-break-start" value="${d.breakStart || '14:00'}">
-        <span style="color:var(--text-muted)">-</span>
-        <input type="time" data-day="${day}" class="day-break-end" value="${d.breakEnd || '18:00'}">
-      </div>
-    `;
-  }).join('');
+    const row = document.createElement('div');
+    row.className = 'schedule-row';
+
+    const label = document.createElement('label');
+    label.textContent = DAY_LABELS[day];
+    row.appendChild(label);
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.dataset.day = day;
+    cb.className = 'day-enable';
+    cb.checked = d.enabled;
+    row.appendChild(cb);
+
+    const startInput = document.createElement('input');
+    startInput.type = 'time';
+    startInput.dataset.day = day;
+    startInput.className = 'day-start';
+    startInput.value = d.start || '09:00';
+    row.appendChild(startInput);
+
+    const dash1 = document.createElement('span');
+    dash1.style.cssText = 'color:var(--text-muted)';
+    dash1.textContent = '-';
+    row.appendChild(dash1);
+
+    const endInput = document.createElement('input');
+    endInput.type = 'time';
+    endInput.dataset.day = day;
+    endInput.className = 'day-end';
+    endInput.value = d.end || '12:00';
+    row.appendChild(endInput);
+
+    const zwsp = document.createElement('span');
+    zwsp.style.cssText = 'color:var(--text-muted)';
+    zwsp.textContent = '​'; // zero-width space
+    row.appendChild(zwsp);
+
+    const breakStartInput = document.createElement('input');
+    breakStartInput.type = 'time';
+    breakStartInput.dataset.day = day;
+    breakStartInput.className = 'day-break-start';
+    breakStartInput.value = d.breakStart || '14:00';
+    row.appendChild(breakStartInput);
+
+    const dash2 = document.createElement('span');
+    dash2.style.cssText = 'color:var(--text-muted)';
+    dash2.textContent = '-';
+    row.appendChild(dash2);
+
+    const breakEndInput = document.createElement('input');
+    breakEndInput.type = 'time';
+    breakEndInput.dataset.day = day;
+    breakEndInput.className = 'day-break-end';
+    breakEndInput.value = d.breakEnd || '18:00';
+    row.appendChild(breakEndInput);
+
+    container.appendChild(row);
+  }
 }
 
 function renderSelectedCategories(selected) {
@@ -341,9 +424,9 @@ async function refreshCategories() {
       .filter(c => !c.is_uncategorized)
       .map(c => `
         <div class="category-item">
-          <input type="checkbox" data-cat-id="${c.id}" data-cat-slug="${c.slug}"
+          <input type="checkbox" data-cat-id="${c.id}" data-cat-slug="${escapeHtml(c.slug)}"
             ${selected.includes(c.id) ? 'checked' : ''}>
-          <label>${c.name} (${c.topic_count})</label>
+          <label>${escapeHtml(c.name)} (${c.topic_count})</label>
         </div>
       `).join('') || '<p style="color:var(--text-muted);font-size:12px;">未获取到版块列表</p>';
 
@@ -358,6 +441,17 @@ async function refreshCategories() {
 async function saveSettings() {
   const btn = document.getElementById('btnSaveSettings');
   const feedback = document.getElementById('saveFeedback');
+
+  const apiKey = document.getElementById('inputApiKey').value.trim();
+  if (apiKey && !/^sk-[\w-]{20,}$/.test(apiKey)) {
+    feedback.textContent = 'API Key 格式异常，应以 sk- 开头';
+    feedback.style.display = 'block';
+    feedback.style.color = 'var(--error)';
+    setTimeout(() => { feedback.style.display = 'none'; feedback.style.color = 'var(--success)'; }, 3000);
+    btn.disabled = false;
+    return;
+  }
+
   btn.disabled = true;
 
   try {

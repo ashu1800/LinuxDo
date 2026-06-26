@@ -103,7 +103,16 @@
       };
     });
 
-    return { title, post_stream: { posts } };
+    return (() => {
+      const replyBtn = findReplyButton();
+      const closedEl = document.querySelector('.topic-status .closed, .topic-status .archived');
+      return {
+        title,
+        post_stream: { posts },
+        commentable: !!replyBtn,
+        commentableReason: replyBtn ? '' : (closedEl ? '话题已关闭/归档' : '无法回复（无回复按钮）')
+      };
+    })();
   }
 
   // ========== DOM Extraction: Notifications ==========
