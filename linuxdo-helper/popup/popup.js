@@ -83,6 +83,12 @@ function updateStatusUI(status) {
   if (status.isPaused) {
     dot.className = 'dot yellow';
     text.textContent = '已暂停';
+  } else if (status.taskLocked) {
+    dot.className = 'dot green';
+    text.textContent = status.blockedReason || '任务运行中';
+  } else if (status.blockedReason) {
+    dot.className = 'dot yellow';
+    text.textContent = status.blockedReason;
   } else if (!status.apiKeyConfigured) {
     dot.className = 'dot red';
     text.textContent = '未配置 API Key';
@@ -283,7 +289,13 @@ async function runNow() {
   const btn = document.getElementById('btnRunNow');
   btn.textContent = '运行中...';
   btn.disabled = true;
-  await chrome.runtime.sendMessage({ action: 'runNow' });
+  const result = await chrome.runtime.sendMessage({ action: 'runNow' });
+  if (result && result.ok === false) {
+    btn.textContent = '手动运行';
+    btn.disabled = false;
+    await refreshStatus();
+    return;
+  }
 
   // Poll until operation completes or timeout
   const startTime = Date.now();

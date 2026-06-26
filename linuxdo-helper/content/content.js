@@ -104,7 +104,7 @@
     });
 
     return (() => {
-      const replyBtn = findReplyButton();
+      const replyBtn = findTopicReplyButton();
       const closedEl = document.querySelector('.topic-status .closed, .topic-status .archived');
       return {
         title,
@@ -162,23 +162,12 @@
     // Scroll to bottom to ensure reply button is visible
     window.scrollTo(0, document.body.scrollHeight);
 
-    // Click reply button - specific post or topic-level
-    let replyBtn;
-    if (replyToPostNumber) {
-      // Reply to a specific post number
-      const targetPost = document.querySelector(`.topic-post[data-post-number="${replyToPostNumber}"]`);
-      if (targetPost) {
-        replyBtn = targetPost.querySelector('.post-controls .reply')
-                || targetPost.querySelector('[data-action="reply"]');
-        if (replyBtn) replyBtn.scrollIntoView();
-      }
-    }
-    // Fallback: topic-level reply button
-    if (!replyBtn) {
-      replyBtn = findReplyButton();
-    }
+    const replyBtn = replyToPostNumber
+      ? findPostReplyButton(replyToPostNumber)
+      : findTopicReplyButton();
     if (!replyBtn) throw new Error('找不到回复按钮');
 
+    replyBtn.scrollIntoView({ block: 'center' });
     replyBtn.click();
 
     // Wait for composer to open
@@ -194,8 +183,7 @@
     await sleep(800);
 
     // Click submit button
-    const submitBtn = document.querySelector('#reply-controls .btn-primary:not(.cancel)')
-                   || document.querySelector('.save-or-cancel .btn-primary');
+    const submitBtn = findComposerSubmitButton();
     if (!submitBtn) throw new Error('找不到提交按钮');
 
     submitBtn.click();
@@ -217,12 +205,54 @@
 
   // ========== Helpers ==========
 
-  function findReplyButton() {
-    // Discourse has multiple possible reply buttons
-    return document.querySelector('#topic-footer-buttons .btn-primary')
-        || document.querySelector('.post-controls .reply')
-        || document.querySelector('button.create')
-        || document.querySelector('[data-action="reply"]');
+  function findTopicReplyButton() {
+    const candidates = [
+      ...document.querySelectorAll('#topic-footer-buttons button, #topic-footer-buttons .btn'),
+      ...document.querySelectorAll('.topic-footer-main-buttons button, .topic-footer-main-buttons .btn')
+    ];
+    return candidates.find(btn =>
+      isUsableButton(btn) && hasReplyIntent(btn) && !btn.closest('.topic-post')
+    ) || null;
+  }
+
+  function findPostReplyButton(postNumber) {
+    const targetPost = document.querySelector(`.topic-post[data-post-number="${postNumber}"]`);
+    if (!targetPost) return null;
+    const candidates = [
+      ...targetPost.querySelectorAll('.post-controls button, .post-controls .btn, [data-action="reply"]')
+    ];
+    return candidates.find(btn => isUsableButton(btn) && hasReplyIntent(btn)) || null;
+  }
+
+  function findComposerSubmitButton() {
+    const composer = document.querySelector('#reply-control, #reply-controls, .composer-fields');
+    if (!composer) return null;
+    const candidates = [
+      ...composer.querySelectorAll('button.btn-primary, .save-or-cancel button.btn-primary')
+    ];
+    return candidates.find(btn => isUsableButton(btn) && !btn.classList.contains('cancel')) || null;
+  }
+
+  function isUsableButton(btn) {
+    if (!btn) return false;
+    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
+    const rect = btn.getBoundingClientRect();
+    const style = window.getComputedStyle(btn);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+
+  function hasReplyIntent(btn) {
+    const text = btn.textContent?.trim().toLowerCase() || '';
+    const title = btn.getAttribute('title')?.toLowerCase() || '';
+    const aria = btn.getAttribute('aria-label')?.toLowerCase() || '';
+    const action = btn.getAttribute('data-action')?.toLowerCase() || '';
+    return action === 'reply'
+        || text.includes('回复')
+        || text.includes('reply')
+        || title.includes('回复')
+        || title.includes('reply')
+        || aria.includes('回复')
+        || aria.includes('reply');
   }
 
   function waitForElement(selector, timeoutMs) {

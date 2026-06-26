@@ -13,6 +13,9 @@ const MAX_REPLY_HISTORY = 200;
 const BACKOFF_BASE_MS = 60000;
 const BACKOFF_MAX_MS = 900000;
 const NAV_TIMEOUT = 30000;
+const TASK_LOCK_TTL_MS = 120000;
+const MAX_NOTIFICATION_ATTEMPTS = 3;
+const REPLY_WAKE_ALARM = 'wakeAfterReplyInterval';
 
 // ========== Current Operation State (in-memory, for popup display) ==========
 
@@ -47,6 +50,51 @@ function clearAll() {
   operationQueue = [];
 }
 
+async function acquireTaskLock(taskName) {
+  const now = Date.now();
+  let acquired = false;
+  let reason = '已有任务运行中';
+  await updateState(state => {
+    const lock = state.taskLock;
+    if (lock && lock.expiresAt && lock.expiresAt > now) {
+      reason = `已有任务运行中: ${lock.taskName}`;
+      return state;
+    }
+    state.taskLock = { taskName, startTime: now, expiresAt: now + TASK_LOCK_TTL_MS };
+    acquired = true;
+    return state;
+  });
+  return { acquired, reason };
+}
+
+async function releaseTaskLock(taskName) {
+  await updateState(state => {
+    if (state.taskLock?.taskName === taskName || !taskName) {
+      state.taskLock = null;
+    }
+    return state;
+  });
+}
+
+function getReplyDelay(settings) {
+  return Math.max(0, Number(settings.minReplyInterval || 0) * 60000);
+}
+
+async function setNextReplyAllowedAt(settings) {
+  const nextReplyAllowedAt = Date.now() + getReplyDelay(settings);
+  await updateState(state => {
+    state.nextReplyAllowedAt = nextReplyAllowedAt;
+    return state;
+  });
+  await scheduleReplyWakeAlarm(nextReplyAllowedAt);
+  return nextReplyAllowedAt;
+}
+
+async function scheduleReplyWakeAlarm(nextReplyAllowedAt) {
+  if (!nextReplyAllowedAt || nextReplyAllowedAt <= Date.now()) return;
+  await chrome.alarms.create(REPLY_WAKE_ALARM, { when: nextReplyAllowedAt });
+}
+
 // ========== Navigation-Based Operations ==========
 
 let requestCounter = 0;
@@ -58,8 +106,7 @@ const pendingRequests = {};
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg.requestId && pendingRequests[msg.requestId]) {
     const entry = pendingRequests[msg.requestId];
-    clearTimeout(entry.timeout);
-    delete pendingRequests[msg.requestId];
+    cleanupRequest(msg.requestId);
     if (msg.error) entry.reject(new Error(msg.error));
     else entry.resolve(msg.data);
   }
@@ -77,20 +124,23 @@ async function navigateAndAct(tabId, url, type, extra = {}) {
       reject(new Error(`操作超时: ${type} (${NAV_TIMEOUT / 1000}s)`));
     }, NAV_TIMEOUT);
 
-    pendingRequests[requestId] = { resolve, reject, timeout };
-
-    // Navigate the tab
-    chrome.tabs.update(tabId, { url });
+    pendingRequests[requestId] = { resolve, reject, timeout, onUpdated: null, retryTimer: null };
 
     // Wait for page to finish loading
     const onUpdated = (changedTabId, changeInfo) => {
       if (changedTabId !== tabId) return;
       if (changeInfo.status !== 'complete') return;
 
+      const entry = pendingRequests[requestId];
+      if (!entry) return;
       chrome.tabs.onUpdated.removeListener(onUpdated);
+      entry.onUpdated = null;
 
       // Give Discourse JS time to initialize
-      setTimeout(async () => {
+      entry.retryTimer = setTimeout(async () => {
+        const activeEntry = pendingRequests[requestId];
+        if (!activeEntry) return;
+        activeEntry.retryTimer = null;
         try {
           const result = await trySendExecute(tabId, requestId, type, extra);
           // Content script will send result back via chrome.runtime.sendMessage
@@ -100,7 +150,12 @@ async function navigateAndAct(tabId, url, type, extra = {}) {
           }
         } catch (err) {
           // Content script might not be injected yet, retry once
-          setTimeout(async () => {
+          const retryEntry = pendingRequests[requestId];
+          if (!retryEntry) return;
+          retryEntry.retryTimer = setTimeout(async () => {
+            const finalEntry = pendingRequests[requestId];
+            if (!finalEntry) return;
+            finalEntry.retryTimer = null;
             try {
               await trySendExecute(tabId, requestId, type, extra);
             } catch (e2) {
@@ -112,15 +167,24 @@ async function navigateAndAct(tabId, url, type, extra = {}) {
       }, 2000);
     };
 
+    pendingRequests[requestId].onUpdated = onUpdated;
     chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.update(tabId, { url }, () => {
+      if (chrome.runtime.lastError) {
+        cleanupRequest(requestId);
+        reject(new Error(`导航失败: ${chrome.runtime.lastError.message}`));
+      }
+    });
   });
 }
 
 function cleanupRequest(requestId) {
-  if (pendingRequests[requestId]) {
-    clearTimeout(pendingRequests[requestId].timeout);
-    delete pendingRequests[requestId];
-  }
+  const entry = pendingRequests[requestId];
+  if (!entry) return;
+  clearTimeout(entry.timeout);
+  if (entry.retryTimer) clearTimeout(entry.retryTimer);
+  if (entry.onUpdated) chrome.tabs.onUpdated.removeListener(entry.onUpdated);
+  delete pendingRequests[requestId];
 }
 
 async function trySendExecute(tabId, requestId, type, extra) {
@@ -160,6 +224,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     case 'cleanup':
       await handleCleanup();
       break;
+    case REPLY_WAKE_ALARM:
+      await handleNewTopicsCheck();
+      await handleNotificationCheck();
+      break;
   }
 });
 
@@ -167,15 +235,19 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 async function handleNewTopicsCheck() {
   const { settings, state } = await getStorage();
-  if (!shouldProceed(settings, state)) return;
+  const proceedCheck = shouldProceed(settings, state);
+  if (!proceedCheck.allowed) return { ok: false, reason: proceedCheck.reason };
 
-  const tab = await findLinuxDoTab();
-  if (!tab) {
-    await addActivity({ type: 'info', status: 'info', message: '未检测到 linux.do 标签页，跳过本轮' });
-    return;
-  }
+  const lock = await acquireTaskLock('topics');
+  if (!lock.acquired) return { ok: false, reason: lock.reason };
 
   try {
+    const tab = await findLinuxDoTab();
+    if (!tab) {
+      await addActivity({ type: 'info', status: 'info', message: '未检测到 linux.do 标签页，跳过本轮' });
+      return { ok: false, reason: '未检测到 linux.do 标签页' };
+    }
+
     setOperation('navigating', '正在导航到最新帖子页面...', '', 5);
 
     // Read latest topics via DOM navigation
@@ -201,7 +273,7 @@ async function handleNewTopicsCheck() {
     if (newTopics.length === 0) {
       clearAll();
       console.log('[LinuxDoHelper] No new topics found');
-      return;
+      return { ok: true, reason: '无新帖' };
     }
 
     // Set up operation queue
@@ -219,8 +291,12 @@ async function handleNewTopicsCheck() {
       if (!rateCheck.allowed) {
         operationQueue[qi].status = 'pending';
         setOperation('waiting', rateCheck.reason, '', 0);
-        state.lastQueue = operationQueue.slice();
-        await setState(state);
+        await updateState(s => {
+          s.lastQueue = operationQueue.slice();
+          s.replyCountThisHour = state.replyCountThisHour;
+          s.replyHourStart = state.replyHourStart;
+          return s;
+        });
         console.log(`[LinuxDoHelper] Rate limited: ${rateCheck.reason}`);
         break;
       }
@@ -243,7 +319,7 @@ async function handleNewTopicsCheck() {
           excerpt: firstPost?.plain || firstPost?.cooked || '',
           replyCount: topic.posts_count || 0
         };
-        const replyResult = await generateReplyWithSafetyCheck(topicData, settings.apiKey, chat);
+        const replyResult = await evaluateAndReply(topicData, settings.apiKey, chat);
 
         if (replyResult.action === 'reply') {
           setOperation('posting', '正在提交回复...', topic.title, 80);
@@ -275,6 +351,12 @@ async function handleNewTopicsCheck() {
               status: 'warning', message: '回复提交失败'
             });
           }
+        } else if (replyResult.action === 'skip') {
+          operationQueue[qi].status = 'skipped';
+          await addActivity({
+            type: 'skip', topicId: topic.id, title: topic.title,
+            status: 'info', message: replyResult.reason || '不值得回复'
+          });
         } else {
           operationQueue[qi].status = 'discarded';
           await addActivity({
@@ -286,7 +368,8 @@ async function handleNewTopicsCheck() {
         // Wait reply interval after successful reply
         if (replyPosted) {
           setOperation('waiting', `等待回复间隔 ${settings.minReplyInterval} 分钟...`, '', 95);
-          await sleep(settings.minReplyInterval * 60000);
+          await setNextReplyAllowedAt(settings);
+          break;
         }
       } else {
         // Topic not commentable — just mark as browsed
@@ -297,28 +380,40 @@ async function handleNewTopicsCheck() {
         });
       }
 
-      state.trackedTopics = tracked;
-      await setState(state);
+      await updateState(s => {
+        s.trackedTopics = tracked;
+        s.lastReplyTime = state.lastReplyTime;
+        s.replyCountThisHour = state.replyCountThisHour;
+        s.replyHourStart = state.replyHourStart;
+        s.replyHistory = state.replyHistory;
+        return s;
+      });
     }
 
     clearOperation();
 
-    state.lastQueue = operationQueue.slice();
-    state.trackedTopics = tracked;
-    state.errorCount = 0;
-    state.lastErrorTime = 0;
-    await setState(state);
+    await updateState(s => {
+      s.lastQueue = operationQueue.slice();
+      s.trackedTopics = tracked;
+      s.errorCount = 0;
+      s.lastErrorTime = 0;
+      return s;
+    });
+    return { ok: true };
 
   } catch (err) {
     clearAll();
     console.error('[LinuxDoHelper] Topic check error:', err);
     await addActivity({ type: 'error', status: 'error', message: `帖子检查异常: ${err.message}` });
-    const s = await getState();
-    await setState({
-      errorCount: (s.errorCount || 0) + 1,
-      lastErrorTime: Date.now(),
-      lastQueue: [{ title: `检查异常: ${err.message}`, status: 'error', action: '', topicId: 0 }]
+    await updateState(s => {
+      s.errorCount = (s.errorCount || 0) + 1;
+      s.lastErrorTime = Date.now();
+      s.lastQueue = [{ title: `检查异常: ${err.message}`, status: 'error', action: '', topicId: 0 }];
+      return s;
     });
+    return { ok: false, reason: err.message };
+  } finally {
+    await releaseTaskLock('topics');
   }
 }
 
@@ -326,17 +421,25 @@ async function handleNewTopicsCheck() {
 
 async function handleNotificationCheck() {
   const { settings, state } = await getStorage();
-  if (!state || state.isPaused) return;
-  if (!settings.autoReplyComments) return;
-  if (!isWithinWorkingHours(settings.schedule)) return;
+  if (!state || state.isPaused) return { ok: false, reason: '已暂停' };
+  if (!settings.autoReplyComments) return { ok: false, reason: '未开启评论回复' };
+  if (!isWithinWorkingHours(settings.schedule)) return { ok: false, reason: '不在工作时段' };
+  if (state.nextReplyAllowedAt && Date.now() < state.nextReplyAllowedAt) {
+    return { ok: false, reason: '回复间隔未到' };
+  }
 
   const rateCheck = canReplyNow(state, settings);
-  if (!rateCheck.allowed) return;
+  if (!rateCheck.allowed) return { ok: false, reason: rateCheck.reason };
 
-  const tab = await findLinuxDoTab();
-  if (!tab) return;
+  const lock = await acquireTaskLock('notifications');
+  if (!lock.acquired) return { ok: false, reason: lock.reason };
 
   try {
+    const tab = await findLinuxDoTab();
+    if (!tab) {
+      return { ok: false, reason: '未检测到 linux.do 标签页' };
+    }
+
     setOperation('navigating', '正在读取通知...', '', 5);
 
     // Read notifications via DOM navigation
@@ -345,10 +448,11 @@ async function handleNotificationCheck() {
     const trackedNotifs = state.trackedNotifications || {};
 
     const relevantNotifs = notifications.filter(n =>
-      n.notification_type === 6 && !trackedNotifs[n.id]
+      n.notification_type === 6 &&
+      (!trackedNotifs[n.id] || (trackedNotifs[n.id].status === 'failed' && (trackedNotifs[n.id].attempts || 0) < MAX_NOTIFICATION_ATTEMPTS))
     );
 
-    if (relevantNotifs.length === 0) { clearAll(); return; }
+    if (relevantNotifs.length === 0) { clearAll(); return { ok: true, reason: '无新通知' }; }
 
     // Set up queue
     operationQueue = relevantNotifs.slice(0, MAX_COMMENTS_PER_CYCLE).map(n => ({
@@ -362,75 +466,136 @@ async function handleNotificationCheck() {
     for (let qi = 0; qi < operationQueue.length; qi++) {
       const notif = relevantNotifs[qi];
       operationQueue[qi].status = 'processing';
+      const previous = trackedNotifs[notif.id] || {};
+      const attempts = (previous.attempts || 0) + 1;
 
-      setOperation('reading', '正在读取帖子详情...', operationQueue[qi].title, 20);
-      const topicDetail = await navigateAndAct(tab.id, `https://linux.do/t/${notif.topic_id}`, 'getTopicDetail');
+      try {
+        setOperation('reading', '正在读取帖子详情...', operationQueue[qi].title, 20);
+        const topicDetail = await navigateAndAct(tab.id, `https://linux.do/t/${notif.topic_id}`, 'getTopicDetail');
 
-      const parentPost = topicDetail.post_stream?.posts?.find(
-        p => p.post_number === notif.post_number
-      );
-      if (!parentPost) continue;
-
-      const result = await evaluateCommentReply(
-        topicDetail.title || '',
-        parentPost.plain || parentPost.cooked || '',
-        notif.data?.original_text || '',
-        settings.apiKey,
-        chat
-      );
-
-      if (result.action === 'reply') {
-        setOperation('posting', '正在提交评论回复...', operationQueue[qi].title, 80);
-
-        const postResult = await navigateAndAct(tab.id, `https://linux.do/t/${notif.topic_id}`, 'postReply', {
-          content: result.content,
-          replyToPostNumber: notif.post_number
-        });
-
-        setOperation('posting', '正在提交评论回复...', operationQueue[qi].title, 90);
-
-        if (postResult.success) {
-          state.lastReplyTime = Date.now();
-          state.replyCountThisHour++;
-          state.replyHistory.push({
-            topicId: notif.topic_id, content: result.content, time: Date.now(), type: 'comment'
-          });
-
+        const parentPost = topicDetail.post_stream?.posts?.find(
+          p => p.post_number === notif.post_number
+        );
+        if (!parentPost) {
+          operationQueue[qi].status = 'skipped';
+          trackedNotifs[notif.id] = { time: Date.now(), status: 'skipped', reason: '找不到父评论', attempts };
           await addActivity({
-            type: 'comment_reply', topicId: notif.topic_id,
-            status: 'success', message: '评论回复成功'
+            type: 'skip', topicId: notif.topic_id,
+            status: 'info', message: '通知父评论不存在，已跳过'
           });
-          operationQueue[qi].status = 'completed';
+          continue;
         }
-      } else {
-        operationQueue[qi].status = 'discarded';
+
+        const result = await evaluateCommentReply(
+          topicDetail.title || '',
+          parentPost.plain || parentPost.cooked || '',
+          notif.data?.original_text || '',
+          settings.apiKey,
+          chat
+        );
+
+        if (result.action === 'reply') {
+          setOperation('posting', '正在提交评论回复...', operationQueue[qi].title, 80);
+
+          const postResult = await navigateAndAct(tab.id, `https://linux.do/t/${notif.topic_id}`, 'postReply', {
+            content: result.content,
+            replyToPostNumber: notif.post_number
+          });
+
+          setOperation('posting', '正在提交评论回复...', operationQueue[qi].title, 90);
+
+          if (postResult.success) {
+            state.lastReplyTime = Date.now();
+            state.replyCountThisHour++;
+            state.replyHistory.push({
+              topicId: notif.topic_id, content: result.content, time: Date.now(), type: 'comment'
+            });
+
+            await addActivity({
+              type: 'comment_reply', topicId: notif.topic_id,
+              status: 'success', message: '评论回复成功'
+            });
+            operationQueue[qi].status = 'completed';
+            trackedNotifs[notif.id] = { time: Date.now(), status: 'replied', attempts };
+            await updateState(s => {
+              s.trackedNotifications = trackedNotifs;
+              s.lastReplyTime = state.lastReplyTime;
+              s.replyCountThisHour = state.replyCountThisHour;
+              s.replyHourStart = state.replyHourStart;
+              s.replyHistory = state.replyHistory;
+              s.lastQueue = operationQueue.slice();
+              return s;
+            });
+            await setNextReplyAllowedAt(settings);
+            break;
+          }
+
+          operationQueue[qi].status = attempts >= MAX_NOTIFICATION_ATTEMPTS ? 'discarded' : 'pending';
+          trackedNotifs[notif.id] = {
+            time: Date.now(),
+            status: attempts >= MAX_NOTIFICATION_ATTEMPTS ? 'failed' : 'failed',
+            reason: '回复提交失败',
+            attempts
+          };
+        } else {
+          operationQueue[qi].status = 'discarded';
+          trackedNotifs[notif.id] = {
+            time: Date.now(),
+            status: 'discarded',
+            reason: result.reason || '评论回复生成失败',
+            attempts
+          };
+          await addActivity({
+            type: 'discard', topicId: notif.topic_id,
+            status: 'warning', message: result.reason || '评论回复生成失败'
+          });
+        }
+      } catch (itemErr) {
+        operationQueue[qi].status = attempts >= MAX_NOTIFICATION_ATTEMPTS ? 'discarded' : 'pending';
+        trackedNotifs[notif.id] = {
+          time: Date.now(),
+          status: attempts >= MAX_NOTIFICATION_ATTEMPTS ? 'failed' : 'failed',
+          reason: itemErr.message,
+          attempts
+        };
+        await addActivity({
+          type: 'error', topicId: notif.topic_id,
+          status: 'error', message: `通知处理失败: ${itemErr.message}`
+        });
       }
 
-      // Only mark as tracked after successful processing
-      trackedNotifs[notif.id] = { time: Date.now() };
-
-      state.trackedNotifications = trackedNotifs;
-      await setState(state);
-
-      if (result.action === 'reply') {
-        setOperation('waiting', `等待回复间隔 ${settings.minReplyInterval} 分钟...`, '', 95);
-        await sleep(settings.minReplyInterval * 60000);
-      }
+      await updateState(s => {
+        s.trackedNotifications = trackedNotifs;
+        s.lastReplyTime = state.lastReplyTime;
+        s.replyCountThisHour = state.replyCountThisHour;
+        s.replyHourStart = state.replyHourStart;
+        s.replyHistory = state.replyHistory;
+        s.lastQueue = operationQueue.slice();
+        return s;
+      });
     }
 
     clearOperation();
 
-    state.trackedNotifications = trackedNotifs;
-    await setState(state);
+    await updateState(s => {
+      s.trackedNotifications = trackedNotifs;
+      s.lastQueue = operationQueue.slice();
+      return s;
+    });
+    return { ok: true };
 
   } catch (err) {
     clearAll();
     console.error('[LinuxDoHelper] Notification check error:', err);
-    await setState({
-      errorCount: (state.errorCount || 0) + 1,
-      lastErrorTime: Date.now(),
-      lastQueue: [{ title: `检查异常: ${err.message}`, status: 'error', action: '', topicId: 0 }]
+    await updateState(s => {
+      s.errorCount = (s.errorCount || 0) + 1;
+      s.lastErrorTime = Date.now();
+      s.lastQueue = [{ title: `检查异常: ${err.message}`, status: 'error', action: '', topicId: 0 }];
+      return s;
     });
+    return { ok: false, reason: err.message };
+  } finally {
+    await releaseTaskLock('notifications');
   }
 }
 
@@ -474,22 +639,26 @@ async function handleCleanup() {
 }
 
 function shouldProceed(settings, state) {
-  if (state.isPaused) return false;
+  if (state.isPaused) return { allowed: false, reason: '已暂停' };
   if (!settings.apiKey) {
     console.log('[LinuxDoHelper] API Key not configured');
-    return false;
+    return { allowed: false, reason: 'API Key 未配置' };
   }
-  if (!isWithinWorkingHours(settings.schedule)) return false;
+  if (!isWithinWorkingHours(settings.schedule)) return { allowed: false, reason: '不在工作时段' };
+
+  if (state.nextReplyAllowedAt && Date.now() < state.nextReplyAllowedAt) {
+    return { allowed: false, reason: '回复间隔未到' };
+  }
 
   if (state.errorCount > 0 && state.lastErrorTime) {
     const backoffMs = Math.min(
       BACKOFF_BASE_MS * Math.pow(2, state.errorCount - 1),
       BACKOFF_MAX_MS
     );
-    if (Date.now() - state.lastErrorTime < backoffMs) return false;
+    if (Date.now() - state.lastErrorTime < backoffMs) return { allowed: false, reason: '错误退避中' };
   }
 
-  return true;
+  return { allowed: true, reason: '' };
 }
 
 async function findLinuxDoTab() {
@@ -508,6 +677,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const opResult = await chrome.storage.local.get(['persistedOp']);
         const persistedOp = opResult.persistedOp;
         const scheduleStatus = getScheduleStatus(settings.schedule);
+        const proceedCheck = shouldProceed(settings, state);
+        const activeLock = state.taskLock && state.taskLock.expiresAt > Date.now() ? state.taskLock : null;
 
         // Use in-memory operation if active, otherwise show last known state
         const opToShow = currentOperation.type !== 'idle'
@@ -526,7 +697,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           scheduleStatus,
           currentOp: opToShow,
           queue: operationQueue,
-          lastQueue: state.lastQueue || []
+          lastQueue: state.lastQueue || [],
+          taskLocked: !!activeLock,
+          nextReplyAllowedAt: state.nextReplyAllowedAt || 0,
+          blockedReason: activeLock ? `已有任务运行中: ${activeLock.taskName}` : (proceedCheck.allowed ? '' : proceedCheck.reason)
         };
       }
 
@@ -541,8 +715,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return { ok: true };
 
       case 'runNow':
-        handleNewTopicsCheck();
-        return { ok: true };
+        return await handleNewTopicsCheck();
 
       case 'getSettings': {
         return await getSettings();
@@ -560,11 +733,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       case 'getCategories': {
         const tab = await findLinuxDoTab();
         if (!tab) return { error: '请先打开 linux.do' };
+        const lock = await acquireTaskLock('categories');
+        if (!lock.acquired) return { error: lock.reason };
         try {
           const result = await navigateAndAct(tab.id, 'https://linux.do/categories', 'getCategories');
           return result;
         } catch (err) {
           return { error: err.message };
+        } finally {
+          await releaseTaskLock('categories');
         }
       }
 

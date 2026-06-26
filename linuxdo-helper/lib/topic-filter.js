@@ -2,6 +2,33 @@
 // Uses DeepSeek to evaluate posts and generate valuable replies
 
 /**
+ * Prompt: Judge if a topic is worth replying to
+ */
+function buildWorthReplyingPrompt(topic) {
+  return {
+    system: '你是一个技术社区资深参与者，擅长判断帖子价值。请以JSON格式回复。',
+    user: `请判断这篇帖子是否值得回复参与讨论。
+
+帖子标题：${topic.title}
+帖子内容：${topic.excerpt || topic.plain || '(无内容)'}
+已有回复数：${topic.replyCount || 0}
+
+评估标准：
+1. 帖子是否有实质内容（提问、讨论、经验分享、项目展示）？
+2. 是否已有很多高质量回复，再加回复还能增加价值吗？
+3. 是否是低质帖（纯升级、纯感叹、无实质内容、纯水文）？
+4. 你能否提供有信息量的补充、解答或不同观点？
+
+请返回以下JSON格式（不要其他文字）：
+{
+  "worthReplying": true/false,
+  "score": 0-10,
+  "reason": "简要理由"
+}`
+  };
+}
+
+/**
  * Prompt: Generate a valuable reply
  */
 function buildGenerateReplyPrompt(topic) {
@@ -74,14 +101,32 @@ function buildCommentReplyPrompt(topicTitle, originalPostContent, commentContent
 }
 
 /**
- * Simplified pipeline: generate reply -> safety check (skip worth-replying evaluation)
+ * Full evaluation pipeline: worth replying? -> generate reply -> safety check
  * @param {Object} topic - { id, title, excerpt/plain, replyCount }
  * @param {string} apiKey
  * @param {Function} chatFn - chat(apiKey, system, user) function
  * @returns {Promise<{action: string, content?: string, reason?: string}>}
  */
-async function generateReplyWithSafetyCheck(topic, apiKey, chatFn) {
-  // Step 1: Generate reply
+async function evaluateAndReply(topic, apiKey, chatFn) {
+  const worthPrompt = buildWorthReplyingPrompt(topic);
+  let worthResult;
+  try {
+    const worthText = await chatFn(apiKey, worthPrompt.system, worthPrompt.user, {
+      extra: { response_format: { type: 'json_object' } }
+    });
+    worthResult = JSON.parse(worthText);
+  } catch (e) {
+    return { action: 'error', reason: `价值判断失败: ${e.message}` };
+  }
+
+  const score = Number(worthResult.score || 0);
+  if (!worthResult.worthReplying || score < 6) {
+    return {
+      action: 'skip',
+      reason: worthResult.reason || `评分 ${score}/10，不值得回复`
+    };
+  }
+
   const genPrompt = buildGenerateReplyPrompt(topic);
   let replyContent;
   try {
@@ -95,6 +140,38 @@ async function generateReplyWithSafetyCheck(topic, apiKey, chatFn) {
   }
 
   // Step 2: Safety check (JSON mode)
+  const safetyPrompt = buildSafetyCheckPrompt(replyContent, topic);
+  try {
+    const safetyText = await chatFn(apiKey, safetyPrompt.system, safetyPrompt.user, {
+      extra: { response_format: { type: 'json_object' } }
+    });
+    const safetyResult = JSON.parse(safetyText);
+    if (!safetyResult.safe) {
+      return {
+        action: 'discard',
+        reason: `安全审核未通过: ${(safetyResult.issues || []).join('; ')}`
+      };
+    }
+  } catch (e) {
+    return { action: 'discard', reason: `安全审核异常: ${e.message}，已丢弃` };
+  }
+
+  return { action: 'reply', content: replyContent.trim() };
+}
+
+async function generateReplyWithSafetyCheck(topic, apiKey, chatFn) {
+  const genPrompt = buildGenerateReplyPrompt(topic);
+  let replyContent;
+  try {
+    replyContent = await chatFn(apiKey, genPrompt.system, genPrompt.user);
+  } catch (e) {
+    return { action: 'error', reason: `回复生成失败: ${e.message}` };
+  }
+
+  if (!replyContent || replyContent.trim().length < 5) {
+    return { action: 'discard', reason: '生成的回复内容为空或过短' };
+  }
+
   const safetyPrompt = buildSafetyCheckPrompt(replyContent, topic);
   try {
     const safetyText = await chatFn(apiKey, safetyPrompt.system, safetyPrompt.user, {

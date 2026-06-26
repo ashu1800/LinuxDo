@@ -34,8 +34,12 @@ const DEFAULT_STATE = {
   lastReplyTime: 0,
   replyCountThisHour: 0,
   replyHourStart: 0,
-  lastQueue: []
+  lastQueue: [],
+  nextReplyAllowedAt: 0,
+  taskLock: null
 };
+
+let stateUpdateQueue = Promise.resolve();
 
 async function getStorage() {
   const result = await chrome.storage.local.get([
@@ -81,6 +85,20 @@ async function setState(partial) {
   return merged;
 }
 
+async function updateState(mutator) {
+  const runUpdate = async () => {
+    const current = await getState();
+    const next = freshDefaults(current);
+    const result = await mutator(next);
+    const stateToSave = result || next;
+    await chrome.storage.local.set({ [STORAGE_KEYS.STATE]: stateToSave });
+    return stateToSave;
+  };
+
+  stateUpdateQueue = stateUpdateQueue.then(runUpdate, runUpdate);
+  return stateUpdateQueue;
+}
+
 async function addActivity(entry) {
   const result = await chrome.storage.local.get([STORAGE_KEYS.ACTIVITY_LOG]);
   const log = result[STORAGE_KEYS.ACTIVITY_LOG] || [];
@@ -101,7 +119,7 @@ async function getActivityLog() {
 
 async function resetState() {
   await chrome.storage.local.set({
-    [STORAGE_KEYS.STATE]: { ...DEFAULT_STATE, trackedTopics: {}, trackedNotifications: {}, replyHistory: [] },
+    [STORAGE_KEYS.STATE]: freshDefaults(DEFAULT_STATE),
     [STORAGE_KEYS.ACTIVITY_LOG]: []
   });
 }

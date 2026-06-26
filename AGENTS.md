@@ -54,6 +54,8 @@ Popup UI (popup.js)              Content Script (content.js)
 
 - **无 ESM 模块**：MV3 Service Worker 不支持 ES modules，使用 `importScripts()` 按序加载 lib 文件
 - **所有状态持久化**：使用 `chrome.storage.local` 存储，支持 Service Worker 的唤醒/休眠生命周期
+- **任务互斥锁**：导航型任务使用 `state.taskLock` 防止新帖/通知/版块刷新并发抢同一标签页
+- **持久化回复间隔**：回复后写入 `state.nextReplyAllowedAt` 并创建 `wakeAfterReplyInterval` alarm，避免 MV3 Service Worker 长时间 sleep
 - **指数退避**：连续错误时暂停，`60s * 2^(errorCount-1)`，最大 15 分钟
 - **双时段调度**：每天支持两个工作时段（如 09:00-12:00 和 14:00-18:00），跨时段自动休息
 - **定时触发 vs 即时响应**：popup 通过 `chrome.runtime.sendMessage` 请求状态，background 实时响应（非 alarm 驱动的交互）
@@ -95,7 +97,13 @@ node --test tests/background-regressions.test.js
 - **activityLog**：活动日志（最大 500 条）
 - **persistedOp**：当前运行态快照，独立于 `state` 写入，避免覆盖业务状态
 
-注意：`deepMerge()` 只做浅层合并，嵌套对象会整个替换而非递归合并。
+`state` 额外包含：
+
+- **nextReplyAllowedAt**：下一次允许回复的时间戳，由 `wakeAfterReplyInterval` alarm 唤醒
+- **taskLock**：当前导航任务锁 `{ taskName, startTime, expiresAt }`
+- **trackedNotifications[id]**：通知终态 `{ time, status, reason?, attempts? }`
+
+注意：后台任务流程优先使用串行 `updateState(mutator)`，避免读-改-写覆盖；`setState(partial)` 仅用于简单 UI 状态更新。
 
 ## 调度与限频（scheduler.js）
 
@@ -118,5 +126,9 @@ node --test tests/background-regressions.test.js
 
 ## 变更历史
 
+[2026-06-26] background - 增加导航任务锁、alarm 驱动回复间隔、导航请求清理、通知终态去重和结构化阻塞状态
+[2026-06-26] topic-filter - 恢复新帖价值判断门控，评分低于 6 的帖子跳过自动回复
+[2026-06-26] content - 拆分 topic/post 回复按钮与 composer 提交按钮选择器，增加可见性和禁用态检查
+[2026-06-26] storage - 新增串行 `updateState()`、`nextReplyAllowedAt`、`taskLock` 状态字段
 [2026-06-26] background - 修复运行态持久化覆盖 state、手动运行早退卡住、提交失败仍等待间隔、限频队列状态未落盘的问题
 [2026-06-26] tests - 新增 `tests/background-regressions.test.js`，覆盖 Service Worker 状态与队列回归行为
